@@ -5,19 +5,23 @@ import type { VoiceDavePrepareEpochData, VoiceDavePrepareTransitionData } from '
 import { SILENCE_FRAME } from '../audio/AudioPlayer';
 
 export interface SessionMethods {
+	canEncrypt: boolean;
 	canPassthrough(userId: string): boolean;
 	decrypt(userId: string, mediaType: 0 | 1, packet: Buffer): Buffer;
 	encryptOpus(packet: Buffer): Buffer;
+	executeTransition(transitionId: number): boolean;
 	getSerializedKeyPackage(): Buffer;
 	getVerificationCode(userId: string): Promise<string>;
+	prepareTransition(transitionId: number, protocolVersion: number): void;
 	processCommit(commit: Buffer): void;
 	processProposals(optype: 0 | 1, proposals: Buffer, recognizedUserIds?: string[]): ProposalsResult;
 	processWelcome(welcome: Buffer): void;
+	protocolVersion: number;
 	ready: boolean;
 	reinit(protocolVersion: number, userId: string, channelId: string): void;
 	reset(): void;
 	setExternalSender(externalSender: Buffer): void;
-	setPassthroughMode(passthrough: boolean, expiry: number): void;
+	setPassthroughMode(passthrough: boolean, expiry?: number): void;
 	voicePrivacyCode: string;
 }
 
@@ -32,10 +36,13 @@ export interface ProposalsResult {
 const TRANSITION_EXPIRY = 10;
 
 /**
- * The arbitrary amount of seconds to allow passthrough for mid-downgrade.
- * Generally, transitions last about 3 seconds maximum, but this should cover for when connections are delayed.
+ * Check whether this packet has the magic marker (0xFAFA).
+ *
+ * @param packet - The packet to check
  */
-const TRANSITION_EXPIRY_PENDING_DOWNGRADE = 24;
+function isDaveFrame(packet: Buffer) {
+	return packet.length > 2 && packet[packet.length - 1] === 0xfa && packet[packet.length - 2] === 0xfa;
+}
 
 /**
  * The amount of packets to allow decryption failure for until we deem the transition bad and re-initialize.
@@ -99,9 +106,9 @@ export class DAVESession extends EventEmitter {
 	private pendingTransitions = new Map<number, number>();
 
 	/**
-	 * Whether this session was downgraded previously.
+	 * Whether the last executed transition was a downgrade, or the session started without end-to-end encryption.
 	 */
-	private downgraded = false;
+	private downgraded: boolean;
 
 	/**
 	 * The amount of consecutive failures encountered when decrypting.
@@ -129,7 +136,15 @@ export class DAVESession extends EventEmitter {
 		this.protocolVersion = protocolVersion;
 		this.userId = userId;
 		this.channelId = channelId;
+		this.downgraded = protocolVersion === 0;
 		this.failureTolerance = options.decryptionFailureTolerance ?? DEFAULT_DECRYPTION_FAILURE_TOLERANCE;
+	}
+
+	/**
+	 * Whether end-to-end encryption is available.
+	 */
+	private get available() {
+		return this.protocolVersion !== 0 && !this.downgraded;
 	}
 
 	/**
@@ -166,10 +181,13 @@ export class DAVESession extends EventEmitter {
 				this.emit('debug', `Session initialized for protocol version ${this.protocolVersion}`);
 			}
 
+			// When upgrading, unencrypted packets are still sent until the transition is executed
+			if (this.downgraded) this.session!.setPassthroughMode(true);
+
 			this.emit('keyPackage', this.session!.getSerializedKeyPackage());
 		} else if (this.session) {
 			this.session.reset();
-			this.session.setPassthroughMode(true, TRANSITION_EXPIRY);
+			this.session.setPassthroughMode(true);
 			this.emit('debug', 'Session reset');
 		}
 	}
@@ -195,11 +213,17 @@ export class DAVESession extends EventEmitter {
 		this.emit('debug', `Preparing for transition (${data.transition_id}, v${data.protocol_version})`);
 		this.pendingTransitions.set(data.transition_id, data.protocol_version);
 
+		try {
+			this.session?.prepareTransition(data.transition_id, data.protocol_version);
+		} catch (error) {
+			this.emit('debug', `Failed to prepare transition ${data.transition_id}: ${error}`);
+		}
+
 		// When the included transition id is 0, the transition is for (re)initialization and it can be executed immediately.
 		if (data.transition_id === 0) {
 			this.executeTransition(data.transition_id);
 		} else {
-			if (data.protocol_version === 0) this.session?.setPassthroughMode(true, TRANSITION_EXPIRY_PENDING_DOWNGRADE);
+			if (data.protocol_version === 0) this.session?.setPassthroughMode(true);
 			return true;
 		}
 
@@ -218,6 +242,15 @@ export class DAVESession extends EventEmitter {
 			return false;
 		}
 
+		// ID 0 already gets executed by davey
+		if (transitionId !== 0) {
+			try {
+				this.session?.executeTransition(transitionId);
+			} catch (error) {
+				this.emit('debug', `Failed to execute transition ${transitionId}: ${error}`);
+			}
+		}
+
 		const oldVersion = this.protocolVersion;
 		this.protocolVersion = this.pendingTransitions.get(transitionId)!;
 
@@ -227,11 +260,10 @@ export class DAVESession extends EventEmitter {
 			this.emit('debug', 'Session downgraded');
 		} else if (transitionId > 0 && this.downgraded) {
 			this.downgraded = false;
-			this.session?.setPassthroughMode(true, TRANSITION_EXPIRY);
+			this.session?.setPassthroughMode(false, TRANSITION_EXPIRY);
 			this.emit('debug', 'Session upgraded');
 		}
 
-		// In the future we'd want to signal to the DAVESession to transition also, but it only supports v1 at this time
 		this.reinitializing = false;
 		this.lastTransitionId = transitionId;
 		this.emit('debug', `Transition executed (v${oldVersion} -> v${this.protocolVersion}, id: ${transitionId})`);
@@ -280,7 +312,7 @@ export class DAVESession extends EventEmitter {
 		const { commit, welcome } = this.session.processProposals(
 			optype,
 			payload.subarray(1),
-			Array.from(connectedClients),
+			[...connectedClients, this.userId],
 		);
 		this.emit('debug', 'MLS proposals processed');
 		if (!commit) return;
@@ -298,6 +330,7 @@ export class DAVESession extends EventEmitter {
 		const transitionId = payload.readUInt16BE(0);
 		try {
 			this.session.processCommit(payload.subarray(2));
+			this.session.prepareTransition(transitionId, this.session.protocolVersion);
 			if (transitionId === 0) {
 				this.reinitializing = false;
 				this.lastTransitionId = transitionId;
@@ -320,11 +353,13 @@ export class DAVESession extends EventEmitter {
 	 * @param payload - The payload
 	 * @returns The transaction id and whether it was successful
 	 */
-	public processWelcome(payload: Buffer): TransitionResult {
+	public processWelcome(payload: Buffer, connectedClients: Set<string>): TransitionResult {
 		if (!this.session) throw new Error('No session available');
 		const transitionId = payload.readUInt16BE(0);
 		try {
-			this.session.processWelcome(payload.subarray(2));
+			// Welcome rosters include ourselves
+			this.session.processWelcome(payload.subarray(2), [...connectedClients, this.userId]);
+			this.session.prepareTransition(transitionId, this.session.protocolVersion);
 			if (transitionId === 0) {
 				this.reinitializing = false;
 				this.lastTransitionId = transitionId;
@@ -345,9 +380,13 @@ export class DAVESession extends EventEmitter {
 	 * Encrypt a packet using end-to-end encryption.
 	 *
 	 * @param packet - The packet to encrypt
+	 * @returns The encrypted packet, or `null` if there is no key to encrypt with yet and the packet should be dropped
 	 */
 	public encrypt(packet: Buffer) {
-		if (this.protocolVersion === 0 || !this.session?.ready || packet.equals(SILENCE_FRAME)) return packet;
+		if (!this.available || !this.session?.ready || packet.equals(SILENCE_FRAME)) return packet;
+		// After a welcome, we dont yet have a key until the transition is executed,
+		// so we need to drop outgoing frames until then to avoid leakage
+		if (!this.session.canEncrypt) return null;
 		return this.session.encryptOpus(packet);
 	}
 
@@ -359,20 +398,26 @@ export class DAVESession extends EventEmitter {
 	 * @returns The decrypted packet, or `null` if the decryption failed but should be ignored
 	 */
 	public decrypt(packet: Buffer, userId: string) {
-		const canDecrypt = this.session?.ready && (this.protocolVersion !== 0 || this.session?.canPassthrough(userId));
-		if (packet.equals(SILENCE_FRAME) || !canDecrypt || !this.session) return packet;
+		if (packet.equals(SILENCE_FRAME) || !this.session) return packet;
+		const canDecrypt = this.session.ready && (this.available || this.session.canPassthrough(userId));
+
+		// Drop packets while the session is not ready yet, unless we are not using end-to-end encryption
+		if (!canDecrypt) return this.available || isDaveFrame(packet) ? null : packet;
+
 		try {
 			// @ts-expect-error - const enum is exported and works (todo: drop const modifier on Davey end)
 			const buffer = this.session.decrypt(userId, Davey.MediaType.AUDIO, packet);
 			this.consecutiveFailures = 0;
 			return buffer;
 		} catch (error) {
-			if (!this.reinitializing && this.pendingTransitions.size === 0) {
+			if (!this.available) {
+				this.emit('debug', 'Failed to decrypt a packet (session downgraded)');
+			} else if (!this.reinitializing && this.pendingTransitions.size === 0) {
 				this.consecutiveFailures++;
 				this.emit('debug', `Failed to decrypt a packet (${this.consecutiveFailures} consecutive fails)`);
 				if (this.consecutiveFailures > this.failureTolerance) {
-					if (this.lastTransitionId) this.recoverFromInvalidTransition(this.lastTransitionId);
-					else throw error;
+					if (this.lastTransitionId === undefined) throw error;
+					this.recoverFromInvalidTransition(this.lastTransitionId);
 				}
 			} else if (this.reinitializing) {
 				this.emit('debug', 'Failed to decrypt a packet (reinitializing session)');
