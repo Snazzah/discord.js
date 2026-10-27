@@ -13,7 +13,7 @@ export interface SessionMethods {
 	getSerializedKeyPackage(): Buffer;
 	getVerificationCode(userId: string): Promise<string>;
 	prepareTransition(transitionId: number, protocolVersion: number): void;
-	processCommit(commit: Buffer): void;
+	processCommit(commit: Buffer): boolean;
 	processProposals(optype: 0 | 1, proposals: Buffer, recognizedUserIds?: string[]): ProposalsResult;
 	processWelcome(welcome: Buffer): void;
 	protocolVersion: number;
@@ -309,11 +309,10 @@ export class DAVESession extends EventEmitter {
 	public processProposals(payload: Buffer, connectedClients: Set<string>): Buffer | undefined {
 		if (!this.session) throw new Error('No session available');
 		const optype = payload.readUInt8(0) as 0 | 1;
-		const { commit, welcome } = this.session.processProposals(
-			optype,
-			payload.subarray(1),
-			[...connectedClients, this.userId],
-		);
+		const { commit, welcome } = this.session.processProposals(optype, payload.subarray(1), [
+			...connectedClients,
+			this.userId,
+		]);
 		this.emit('debug', 'MLS proposals processed');
 		if (!commit) return;
 		return welcome ? Buffer.concat([commit, welcome]) : commit;
@@ -329,7 +328,11 @@ export class DAVESession extends EventEmitter {
 		if (!this.session) throw new Error('No session available');
 		const transitionId = payload.readUInt16BE(0);
 		try {
-			this.session.processCommit(payload.subarray(2));
+			if (!this.session.processCommit(payload.subarray(2))) {
+				this.emit('debug', `MLS commit ignored (transition id: ${transitionId})`);
+				return { transitionId, success: false };
+			}
+
 			this.session.prepareTransition(transitionId, this.session.protocolVersion);
 			if (transitionId === 0) {
 				this.reinitializing = false;
